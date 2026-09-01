@@ -1,0 +1,78 @@
+# unified name prefix of all aws resource instances of THIS sub-project
+# (currently only the dynamodb user table). each service has its own prefix.
+name_prefix: test-cognito-example
+
+cognito:
+  user_pool:
+    name: my-user-pool
+    self_signup_enabled: false
+
+    # aws-managed domain gives hosted pages like /login /logout /oauth2/token at
+    # https://<prefix>.auth.<region>.amazoncognito.com
+    # prefix: only lowercase letters, numbers, hyphens; must be unique across
+    # all aws accounts in the region.
+    domain:
+      type: aws-managed
+      prefix: example-app-auth
+    # users is a list, so that the authentic config layer replaces it entirely,
+    # instead of merging example users into the authentic user set.
+    users:
+      - username: alice
+        email: alice@example.com
+        custom_attributes:
+          tenant_id: tenant-A
+        groups:
+          - appA-user
+          - appB-user
+
+      - username: bob
+        email: bob@example.com
+        custom_attributes:
+          tenant_id: tenant-B
+        groups:
+          - appA-user
+
+    password_policy:
+      minimum_length: 12
+      require_uppercase: true
+      require_lowercase: true
+      require_numbers: true
+      require_symbols: true
+
+    custom_attributes:
+      - name: tenant_id
+        type: string
+        mutable: true
+
+    groups:
+      - appA-user
+      - appB-user
+      - admin
+
+    resource_servers:
+      - identifier: api
+        scopes:
+          - name: read
+            description: Read API resources
+          - name: write
+            description: Modify API resources
+    app_clients:
+      web:
+        generate_secret: false
+
+        callback_urls:
+          - https://app.example.com/callback
+
+        logout_urls:
+          - https://app.example.com/
+
+        oauth:
+          flows:
+            - authorization_code
+
+          scopes:
+            - openid
+            - email
+            - api/read
+            - api/write
+

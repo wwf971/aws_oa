@@ -35,14 +35,18 @@ It is encouraged that common logic used by different sub-projecs to be extracted
 
 ## Test Design
 
-Each sub-project should have a test script(for example `test.py`) under the sub-project folder. There can be multiple test items(not mandantory, should be based on actual situation).
+Each sub-project should have a test script(for example `test.py`) under the sub-project folder. There can be multiple test items(not mandantory, should be based on actual situation). There should be a default test item that is executed when simply running something like `python test.py`.
 
 One typical test pattern is create resources-->do some operations-->finally delete them. This reproduces the process of ensurement and removal of resource instances, as well as operations performed on the resource instances.
 
 In test, when creating resources, instead of directly using prefix specified in local config of the sub-project, use something like `{prefix}_temp_{19700101_12000000+09}` where +09 indicates timezone. This avoids the risk of collision with existing resource instances. Test should be suspended if detecting that a resource instance of same name and type of the test resource object to be created.
 
+Test script should also support a `--clean` parameter to clean all resources created but not deleted by previous tests that failed halfway. These resources should be located by string matching. The `--clean` feature should also support `--assume-prefix`.
+
 ## Implementation Preference
 
 PK/SK/GSI of DynamoDB should be properly designed. Generally, GSI projection type should be 'KEYS_ONLY' or 'INCLUDE', not 'ALL'. Reqeusting two times(GSI --> primary) to get full information is allowed.
 
-All id format should conform to `id-format.md`. Time stamp display and storage should conform to `time-format.md`.
+All id format should conform to `id-format.md`. Time stamp display and storage should conform to `time-format.md`. This should be applied when implementing sub-projects.
+
+Core requirement will usually be written in a file with name style like `xxx_req.md` or `xxx_req_min.md` under the sub-project folder. Human developer/ai agent its (incremental) implementation in a `xxx_impl.md` file, in a manner that conforms to principles in `doc-design.md`.

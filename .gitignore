@@ -1,0 +1,13 @@
+*.zip
+*.rar
+__pycache__/
+*.pyc
+node_modules/
+
+dist/
+build/
+deploy*
+
+config.0*
+config_gen*
+*ai-dev*
