@@ -1,0 +1,33 @@
+# asset service config, example layer. authentic values go to config.0.yaml
+# (git-ignored). account-level config (aws credentials) lives in
+# /2026/aws_oa/config/config.yaml + config.0.yaml.
+# cognito ids (user pool id, app client id) are not configured here: they are
+# read from ../_0_auth_cognito/config_gen.yaml.
+
+# unified name prefix of all aws resource instances of THIS service (buckets,
+# table, lambda, api, ...). each service has its own prefix. s3 bucket names
+# are unique across ALL aws accounts, so include a personal suffix; only
+# lowercase letters, numbers, hyphens.
+name_prefix: asset-service-example
+
+asset_service:
+  cognito:
+    # app client (of _0_auth_cognito user pool) used by the frontend login
+    app_client: web
+    # group required to access this service at all
+    group_access: asset-service
+    # group whose members are asset-service admin (others are guest)
+    group_admin: admin
+
+  lambda:
+    runtime: python3.12
+    memory_mb: 256
+    # folder-asset download zips inside lambda, give it some time
+    timeout_sec: 120
+
+  cloudfront:
+    # cloudfront has no asia-only price class; every class always includes
+    # north america + europe. PriceClass_200 is the cheapest one that adds
+    # asia edge locations (incl. tokyo). other values: PriceClass_100
+    # (NA + EU only), PriceClass_All.
+    price_class: PriceClass_200

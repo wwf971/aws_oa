@@ -1,0 +1,24 @@
+{
+  "name": "@wwf971/asset-service-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev:login": "vite --config vite.login.config.js",
+    "dev:main": "vite --config vite.main.config.js",
+    "build": "vite build --config vite.login.config.js && vite build --config vite.main.config.js",
+    "build:login": "vite build --config vite.login.config.js",
+    "build:main": "vite build --config vite.main.config.js"
+  },
+  "dependencies": {
+    "@wwf971/react-comp-misc": "workspace:^",
+    "mobx": "^6.15.0",
+    "mobx-react-lite": "^4.1.1",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.0.1",
+    "vite": "^8.0.10"
+  }
+}
