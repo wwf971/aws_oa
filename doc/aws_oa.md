@@ -43,6 +43,13 @@ In test, when creating resources, instead of directly using prefix specified in 
 
 Test script should also support a `--clean` parameter to clean all resources created but not deleted by previous tests that failed halfway. These resources should be located by string matching. The `--clean` feature should also support `--assume-prefix`.
 
+One exception to the create-then-delete pattern: iam roles used as lambda execution roles. A freshly created role can stay un-assumable by lambda for several minutes, and revoking a permission from an in-use role takes similarly long to become effective (granting is fast). Therefore:
+
+- Test scripts should keep their lambda execution roles under STABLE names (still containing the `-temp-` marker so `--clean` finds them), reuse them across runs instead of recreating them, and only rewrite the inline policies each run to point at the current timestamped resources.
+- A test that needs an operation to be denied (for example to check transaction rollback) should not revoke the permission from the in-use role and wait; it should switch the lambda to a second persistent role whose policy never allowed the operation.
+
+Measurements and the debugging path behind this rule are in `./aws_oa_impl.md#iam-propagation`.
+
 ## Implementation Preference
 
 PK/SK/GSI of DynamoDB should be properly designed. Generally, GSI projection type should be 'KEYS_ONLY' or 'INCLUDE', not 'ALL'. Reqeusting two times(GSI --> primary) to get full information is allowed.

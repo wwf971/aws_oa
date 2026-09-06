@@ -9,5 +9,6 @@ build/
 deploy*
 
 config.0*
-config_gen*
+config_gen.yaml
+config_gen.json
 *ai-dev*

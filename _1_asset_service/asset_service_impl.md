@@ -117,8 +117,8 @@ gsi_asset_id   PK asset_id, projection KEYS_ONLY
 ### lambda `{prefix}-asset-api`
 
 - runtime python 3.12, single source folder `backend/` zipped by `ensure_architect.py` (boto3 comes with the runtime, no packaging of deps).
-- env vars: asset bucket name, asset-node table name, user table name.
-- role `{prefix}-asset-api-role` allows: cloudwatch logs; Query on user table gsi; Query/Get/Put/Update/BatchWrite on asset-node table; Get/Put/Delete/List on the asset bucket.
+- env vars: asset bucket name, asset-node table name, user table name, and (when `_1a_asset_timeline` has been ensured) the timeline-asset table name from that service's `config_gen.yaml`.
+- role `{prefix}-asset-api-role` allows: cloudwatch logs; Query on user table gsi; Query/Get/Put/Update/BatchWrite on asset-node table; Query/Delete on the timeline-asset table of `_1a_asset_timeline` (so asset delete can remove collect entries in the same dynamodb transaction); Get/Put/Delete/List on the asset bucket.
 
 ### api gateway http api `{prefix}-asset-api`
 
@@ -159,7 +159,7 @@ All responses use `{code, data, message}`; code 0 = success, code < 0 = failure.
 | POST `/api/asset` | admin | begin asset upload, returns presigned put urls |
 | POST `/api/asset-complete` | admin | `{node_id}` finish upload, verify objects, set ready |
 | PATCH `/api/node/{node_id}` | admin | rename `{name}` or move `{parent_id?, lexorank}` |
-| DELETE `/api/node/{node_id}` | admin | delete subtree, incl. s3 objects of contained assets |
+| DELETE `/api/node/{node_id}` | admin | delete subtree, incl. s3 objects of contained assets and their collect entries on every timeline |
 | GET `/api/download/{node_id}` | guest | presigned download url |
 
 upload flow (browser does the byte transfer, lambda only signs):
@@ -188,7 +188,7 @@ GET /api/download/{node_id}
                    (limited by lambda /tmp 512MB; fine for a simple web drive)
 ```
 
-delete flow: collect the subtree of the node (from the user's node rows), delete s3 objects of every contained asset (`{asset_id}/` prefixes), then batch-delete the node rows.
+delete flow: collect the subtree of the node (from the user's node rows), look up every contained asset on the timeline-asset table (`gsi_asset_id` of `_1a_asset_timeline`), then one dynamodb transaction deletes the node rows AND all those collect entries. if any item in that transaction fails, dynamodb rolls the whole write back (the subtree stays in the tree and every timeline still collects it). s3 objects of contained assets (`{asset_id}/` prefixes) are removed only after the transaction succeeds. dynamodb `TransactWriteItems` allows at most 100 items; a larger subtree is refused before any write. the timeline table name is read from `_1a_asset_timeline/config_gen.yaml`; if that file is missing (timeline not deployed), delete skips collect-entry cleanup — re-run `ensure_architect.py` here after the timeline service is up.
 
 ## Login Flow (oauth2 authorization code + pkce)
 
@@ -275,6 +275,8 @@ deploy order for a fresh account:
 3. add https://{cloudfront-domain}/ to callback_urls/logout_urls in
    _0_auth_cognito/config.0.yaml, rerun ensure_cognito.py
 4. _1_asset_service: ensure_frontend.py
+5. after _1a_asset_timeline/ensure_architect.py, re-run this
+   ensure_architect.py so the lambda is wired to the timeline-asset table
 ```
 
 ## AWS Permission Settings (for the deploying iam user)

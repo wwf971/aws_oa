@@ -52,6 +52,7 @@ from config_gen import (
     config_gen_save,
     config_load,
     names_build,
+    timeline_gen_load,
 )
 
 DIR_BACKEND = DIR_SELF / "backend"
@@ -171,7 +172,10 @@ def asset_node_table_ensure(dynamodb, table_name):
 def api_role_ensure(iam, names, region, account_id):
     """execution role of the api lambda: cloudwatch logs, read of the user
     table (owned by _0_auth_cognito), item access on the asset-node table,
-    object access on the asset bucket. returns the role arn."""
+    object access on the asset bucket, and (when the timeline service is
+    wired) Query/Delete on its timeline-asset table so asset delete can
+    remove collect entries in the same dynamodb transaction. returns the
+    role arn."""
     policy = {
         "Version": "2012-10-17",
         "Statement": [
@@ -217,6 +221,16 @@ def api_role_ensure(iam, names, region, account_id):
             },
         ],
     }
+    if names.get("table_timeline_asset"):
+        policy["Statement"].append({
+            "Sid": "TimelineAssetTable",
+            "Effect": "Allow",
+            "Action": ["dynamodb:Query", "dynamodb:DeleteItem"],
+            "Resource": [
+                f"arn:aws:dynamodb:{region}:{account_id}:table/{names['table_timeline_asset']}",
+                f"arn:aws:dynamodb:{region}:{account_id}:table/{names['table_timeline_asset']}/index/*",
+            ],
+        })
     return lambda_role_ensure(iam, names["lambda_role"], policy)
 
 
@@ -225,13 +239,16 @@ def api_role_ensure(iam, names, region, account_id):
 
 def lambda_env_build(names, config):
     service_config = config["asset_service"]
-    return {
+    env = {
         "BUCKET_ASSET": names["bucket_asset"],
         "TABLE_ASSET_NODE": names["table_asset_node"],
         "TABLE_USER": names["table_user"],
         "GROUP_ACCESS": service_config["cognito"]["group_access"],
         "GROUP_ADMIN": service_config["cognito"]["group_admin"],
     }
+    if names.get("table_timeline_asset"):
+        env["TABLE_TIMELINE_ASSET"] = names["table_timeline_asset"]
+    return env
 
 
 def api_lambda_ensure(lambda_client, names, config, role_arn):
@@ -638,6 +655,22 @@ def architecture_ensure(config, names):
             "run _0_auth_cognito/ensure_user_table.py first"
         )
     names["table_user"] = cognito_gen["user_table"]["table_name"]
+
+    # the timeline-asset table belongs to _1a_asset_timeline (own name
+    # prefix). when that service is not ensured yet, delete skips collect
+    # entry cleanup; re-run this script after the timeline service is up
+    timeline_gen = timeline_gen_load()
+    table_timeline_asset = (
+        (timeline_gen or {}).get("asset_timeline") or {}
+    ).get("table_timeline_asset")
+    if table_timeline_asset:
+        names["table_timeline_asset"] = table_timeline_asset
+        print(f"timeline-asset table (from _1a_asset_timeline): {table_timeline_asset}")
+    else:
+        print(
+            "timeline-asset table not wired: "
+            "_1a_asset_timeline/config_gen.yaml missing or incomplete"
+        )
 
     s3 = aws_client_make(config, "s3")
     dynamodb = aws_client_make(config, "dynamodb")

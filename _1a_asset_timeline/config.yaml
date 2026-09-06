@@ -1,0 +1,26 @@
+# asset timeline service config, example layer. authentic values go to
+# config.0.yaml (git-ignored). account-level config (aws credentials) lives in
+# /2026/aws_oa/config/config.yaml + config.0.yaml.
+# cognito ids (user pool id, app client id) are not configured here: they are
+# read from ../_0_auth_cognito/config_gen.yaml.
+
+# unified name prefix of all aws resource instances of THIS service (tables,
+# lambda, api). each service has its own prefix.
+# style: {user alias}-{sub-project name}.
+name_prefix: alice123-asset-timeline
+
+asset_timeline:
+  cognito:
+    # app client (of _0_auth_cognito user pool) used by clients of this api
+    app_client: web
+    # group required to access this service at all. the timeline service is an
+    # extension of the asset service, so the same access group is reused
+    group_access: asset-service
+    # group whose members can modify timelines (others are read-only guest)
+    group_admin: admin
+
+  lambda:
+    runtime: python3.12
+    memory_mb: 256
+    # pure dynamodb api, no large transfer inside lambda
+    timeout_sec: 30

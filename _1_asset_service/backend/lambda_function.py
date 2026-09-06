@@ -3,6 +3,8 @@
 # resolves user_id from the user table, checks the role (admin/guest) from
 # cognito groups, and serves the tree/asset apis.
 # see asset_service_impl.md#api for the api list and flows.
+# DELETE /api/node/{id} also removes contained assets from every timeline
+# that collects them, in the same dynamodb transaction as the node rows.
 
 import base64
 import json
@@ -17,10 +19,14 @@ from urllib.parse import quote
 
 import boto3
 from boto3.dynamodb.conditions import Key
+from boto3.dynamodb.types import TypeSerializer
+from botocore.exceptions import ClientError
 
 BUCKET_ASSET = os.environ["BUCKET_ASSET"]
 TABLE_ASSET_NODE = os.environ["TABLE_ASSET_NODE"]
 TABLE_USER = os.environ["TABLE_USER"]
+# owned by _1a_asset_timeline; empty when that service is not wired yet
+TABLE_TIMELINE_ASSET = os.environ.get("TABLE_TIMELINE_ASSET") or ""
 GROUP_ACCESS = os.environ["GROUP_ACCESS"]
 GROUP_ADMIN = os.environ["GROUP_ADMIN"]
 
@@ -29,11 +35,19 @@ PRESIGN_EXPIRE_SEC = 3600
 ID_LENGTH = 16
 ID_CHARS = string.digits + string.ascii_lowercase
 RANK_CHARS = string.digits + string.ascii_lowercase  # '0' < ... < 'z'
+# dynamodb TransactWriteItems hard limit; a delete that would exceed this
+# is refused before any write, so nothing is partially removed
+TRANSACT_WRITE_MAX = 100
 
 s3 = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
+dynamodb_client = boto3.client("dynamodb")
+serializer = TypeSerializer()
 table_node = dynamodb.Table(TABLE_ASSET_NODE)
 table_user = dynamodb.Table(TABLE_USER)
+table_timeline_asset = (
+    dynamodb.Table(TABLE_TIMELINE_ASSET) if TABLE_TIMELINE_ASSET else None
+)
 
 # sub -> user_id, cached for the lifetime of the lambda container
 user_id_cache = {}
@@ -473,6 +487,35 @@ def node_move(user_id, node_id, parent_id, lexorank):
     return resp_ok()
 
 
+def item_typed(item):
+    """resource-layer item -> typed attribute values of the low-level client
+    (transact_write_items only exists on the low-level client)."""
+    return {key: serializer.serialize(value) for key, value in item.items()}
+
+
+def transact_delete(table_name, key):
+    return {"Delete": {"TableName": table_name, "Key": item_typed(key)}}
+
+
+def collect_entries_of_asset(user_id, asset_id):
+    """this user's collect entries for the asset, via gsi_asset_id of the
+    timeline-asset table. the gsi is eventually consistent, same as the
+    timeline service's own collect/remove path."""
+    if table_timeline_asset is None:
+        return []
+    entries = []
+    params = {
+        "IndexName": "gsi_asset_id",
+        "KeyConditionExpression": Key("asset_id").eq(asset_id),
+    }
+    while True:
+        page = table_timeline_asset.query(**params)
+        entries.extend(item for item in page["Items"] if item["user_id"] == user_id)
+        if "LastEvaluatedKey" not in page:
+            return entries
+        params["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+
+
 def api_node_delete(user_id, node_id):
     node_get(user_id, node_id)
     nodes = nodes_all(user_id)
@@ -490,15 +533,75 @@ def api_node_delete(user_id, node_id):
         subtree_ids.append(current_id)
         pending_ids.extend(child_ids_by_parent.get(current_id, []))
 
+    asset_ids = []
     for subtree_id in subtree_ids:
         asset_id = nodes_by_id[subtree_id].get("asset_id")
         if asset_id:
-            s3_prefix_delete(f"{asset_id}/")
+            asset_ids.append(asset_id)
 
-    with table_node.batch_writer() as batch:
-        for subtree_id in subtree_ids:
-            batch.delete_item(Key={"user_id": user_id, "node_id": subtree_id})
-    return resp_ok({"node_ids_deleted": subtree_ids})
+    collect_entries = []
+    for asset_id in asset_ids:
+        collect_entries.extend(collect_entries_of_asset(user_id, asset_id))
+
+    # node rows and collect entries go in ONE transaction: if any timeline
+    # removal fails, dynamodb rolls the whole write back (tree + timelines
+    # stay as they were). s3 is not part of dynamodb transactions and is
+    # deleted only after this write succeeds.
+    action_list = [
+        transact_delete(TABLE_ASSET_NODE, {"user_id": user_id, "node_id": subtree_id})
+        for subtree_id in subtree_ids
+    ]
+    if TABLE_TIMELINE_ASSET:
+        action_list.extend(
+            transact_delete(
+                TABLE_TIMELINE_ASSET,
+                {"timeline_id": entry["timeline_id"], "time_key": entry["time_key"]},
+            )
+            for entry in collect_entries
+        )
+
+    if len(action_list) > TRANSACT_WRITE_MAX:
+        raise ApiError(
+            -1,
+            f"delete touches {len(action_list)} dynamodb items "
+            f"(limit {TRANSACT_WRITE_MAX}); delete a smaller subtree",
+        )
+
+    try:
+        dynamodb_client.transact_write_items(TransactItems=action_list)
+    except ClientError as error:
+        # AccessDeniedException: the transaction was rejected as a whole
+        # (e.g. DeleteItem not allowed on the timeline-asset table) and
+        # nothing was written, so tree + timelines stay as they were, the
+        # same rollback outcome as a cancelled transaction
+        if error.response["Error"]["Code"] == "AccessDeniedException":
+            raise ApiError(
+                -5,
+                f"delete rolled back: {error.response['Error']['Message']}",
+                http_status=500,
+            )
+        if error.response["Error"]["Code"] != "TransactionCanceledException":
+            raise
+        reasons = error.response.get("CancellationReasons") or []
+        detail = "; ".join(
+            reason.get("Message") or reason.get("Code", "")
+            for reason in reasons
+            if reason.get("Code") not in (None, "None")
+        )
+        raise ApiError(
+            -5,
+            "delete rolled back: "
+            + (detail or "a node or timeline collect removal failed"),
+            http_status=500,
+        )
+
+    for asset_id in asset_ids:
+        s3_prefix_delete(f"{asset_id}/")
+
+    return resp_ok({
+        "node_ids_deleted": subtree_ids,
+        "timeline_entry_count_deleted": len(collect_entries),
+    })
 
 
 def s3_prefix_delete(prefix):
