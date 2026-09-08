@@ -1,0 +1,17 @@
+# config of the local es service only. aws account config stays in /config/config.yaml
+name_prefix: local-es-test
+
+local_es:
+  task_retention: 1h          # how long an unfetched task stays in the task queue
+  task_visibility: 60         # seconds a fetched but unacked task stays invisible before redelivery
+  result_expire: 10m          # how long a result item stays in the result table (ttl)
+  result_timeout: 20          # seconds the requester waits for one result
+  result_poll_interval: 0.25  # seconds between result polls of the requester
+
+# local elasticsearch endpoint. used by the worker on the home server only.
+elasticsearch:
+  endpoint_use: local
+  local:
+    scheme: http
+    host: 127.0.0.1
+    port: 9200
