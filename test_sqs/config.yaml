@@ -1,0 +1,4 @@
+# config of the sqs test only. aws account config stays in /config/config.yaml
+sqs:
+  queue_name: SQSTest
+  msg_retention: 4d  # how long undelivered messages stay in queue. 1d, 12h, 3600, etc.
