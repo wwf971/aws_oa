@@ -19,7 +19,11 @@ Actually, we need to conside the potential problem that the prefix on config is 
 
 It is also engouraged that when a sub-project creates external resource objects, they use their own prefix to identify what it has created. For example, when utilizing external elasticsearch indices provided the local es sub-project(in `_{sub-project index}_local_es/` folder), the index name should be like `{sub-project index}_xxx`.
 
-The prefix should typically start with a user alias, optionally followed by a time string, and then a service name. For exapmle:  alice123-2025-image-processing.
+The prefix should typically start with a user alias, optionally followed by a time string, and then a service name. For example: `alice123-2025-image-processing`.
+
+AWS resources whose physical names can be chosen must terminate the sub-project prefix with the separator `--`: `{prefix}--{resource-name}`. For example: `alice123-2025-image-processing--input-bucket`. The sequence `--` is reserved for this boundary and must not occur inside either the prefix or the resource-specific name; single hyphens may still occur inside both. Prefix-based matching, inspection, and deletion must match `{prefix}--`, not the bare prefix, so that a prefix cannot also match another prefix that merely starts with the same text. Some previously created resource instances might not conform to this rule; leave those existing instances unchanged.
+
+The separator is `--`, not `:`. A colon is invalid in several resource names used by this project, including S3 buckets, SQS queues, Lambda functions, DynamoDB tables, and IAM roles. Hyphens are accepted by those services and by Cognito domain prefixes. AWS has no punctuation character accepted by every resource type, so service-specific naming restrictions must still be checked before adding a new resource type; if a service does not permit `--`, document the exception and use the service's tags or other searchable metadata for namespace identification.
 
 ## Arthitecture Ensurement
 

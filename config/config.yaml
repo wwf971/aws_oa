@@ -1,0 +1,6 @@
+
+# aws config(this backend service --> aws services)
+aws:
+  region_name: ap-northeast-1
+  access_key_id: EXAMPLE_ACCESS_KEY_ID
+  secret_access_key: EXAMPLE_SECRET_ACCESS_KEY
