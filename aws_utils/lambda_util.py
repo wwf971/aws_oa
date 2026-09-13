@@ -22,12 +22,17 @@ TRUST_POLICY_LAMBDA = {
 }
 
 
-def lambda_zip_build(dir_backend):
+def lambda_zip_build(dir_backend, path_list_extra=None):
     """deployment zip of all *.py directly under dir_backend (boto3 comes
-    with the lambda runtime, no packaging of dependencies)."""
+    with the lambda runtime, no packaging of dependencies). path_list_extra:
+    additional files zipped in at the top level, e.g. a library file exposed
+    by another sub-project."""
+    path_list = sorted(Path(dir_backend).glob("*.py"))
+    for path_extra in path_list_extra or []:
+        path_list.append(Path(path_extra))
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        for path in sorted(Path(dir_backend).glob("*.py")):
+        for path in path_list:
             zip_file.write(path, path.name)
     return buffer.getvalue()
 

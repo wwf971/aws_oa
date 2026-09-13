@@ -1,10 +1,12 @@
 # test of the tag/type service:
 #
 #   backend  (default) needs no deployed architecture: creates a TEMPORARY
-#            stack from zero (all eight dynamodb tables, lambda role, lambda)
-#            under the prefix {prefix}-temp-{timestamp}, runs the tag tree /
-#            history / obj attach flow plus a type independence check through
-#            the temp lambda, then removes every temp resource. this
+#            stack from zero (two temp name indices on the local es service,
+#            all eight dynamodb tables, lambda role, lambda) under the prefix
+#            {prefix}-temp-{timestamp}, runs the tag tree / history / obj
+#            attach flow, the char-level name search flow, an
+#            index-confirmation failure check, plus a type independence check
+#            through the temp lambda, then removes every temp resource. this
 #            reproduces ensurement, operation and removal of the architecture.
 #   api      checks that the DEPLOYED http api rejects requests without a
 #            cognito jwt; requires ensure_architect.py to have been run
@@ -12,6 +14,8 @@
 #
 # external dependencies of both items: _0_auth_cognito must be deployed
 # (cognito user pool with an admin user, user table with its user_id mapping).
+# the backend item additionally needs _2_local_es deployed and its worker on
+# the home server running (the temp indices live on the local elasticsearch).
 # obj ids in this service are plain references (not validated against the
 # sub-project owning the obj), so the test uses generated fake obj ids.
 #
@@ -23,6 +27,7 @@
 
 import argparse
 import json
+import re
 import secrets
 import string
 import sys
@@ -49,11 +54,17 @@ from config_gen import (
     cognito_gen_load,
     config_gen_load,
     config_load,
+    index_names_build,
+    local_es_client_make,
+    local_es_gen_load,
     names_build,
 )
 from ensure_architect import (
     api_lambda_ensure,
     api_role_ensure,
+    indices_delete,
+    indices_ensure,
+    lambda_env_build,
     tag_type_tables_ensure,
 )
 
@@ -67,6 +78,12 @@ TABLE_SUFFIX_LIST = (
     "-tag", "-tag-history", "-obj-tag", "-obj-tag-history",
     "-type", "-type-history", "-obj-type", "-obj-type-history",
 )
+
+# temp timestamp inside an aws residue name, e.g. '...-temp-20260913_23015944p09--tag'.
+# --clean recovers the timestamps of failed runs from it, to also delete the
+# temp name indices of those runs (the local es service has no index list
+# api, so index residue is only findable through the aws residue names)
+TIMESTAMP_TEMP_RE = re.compile(r"-temp-(\d{8}_\d{8}[pm]\d{2})")
 
 
 def test_run(args):
@@ -109,50 +126,75 @@ def test_api():
 
 def test_backend(config):
     """create temp architecture from zero -> run the api flow -> remove it."""
-    prefix_temp = f"{config['name_prefix']}-temp-{timestamp_resource_make()}"
+    timestamp = timestamp_resource_make()
+    prefix_temp = f"{config['name_prefix']}-temp-{timestamp}"
     names = names_build({"name_prefix": prefix_temp})
     names["table_user"] = cognito_gen_load()["user_table"]["table_name"]
+    # throwaway name indices of this run, e.g. 3_tag_temp_20260913_23015944p09
+    index_names = index_names_build(f"_temp_{timestamp}")
 
+    es_gen = local_es_gen_load()
+    es = local_es_client_make(config, es_gen)
     dynamodb = aws_client_make(config, "dynamodb")
     iam = aws_client_make(config, "iam")
     lambda_client = aws_client_make(config, "lambda")
     sts = aws_client_make(config, "sts")
     cognito = aws_client_make(config, "cognito-idp")
 
-    temp_resources_absent_check(dynamodb, iam, lambda_client, names)
+    temp_resources_absent_check(dynamodb, iam, lambda_client, es, names, index_names)
     claims = admin_claims_get(config, cognito)
 
     try:
         step(f"backend: create temp architecture, prefix {prefix_temp}")
         region = config["aws"]["region_name"]
         account_id = sts.get_caller_identity()["Account"]
+        indices_ensure(es, index_names)
         tag_type_tables_ensure(dynamodb, names)
-        role_arn = api_role_ensure(iam, names, region, account_id)
-        api_lambda_ensure(lambda_client, names, config, role_arn)
+        role_arn = api_role_ensure(iam, names, region, account_id, es_gen)
+        api_lambda_ensure(
+            lambda_client, names, config, role_arn, es_gen, index_names
+        )
         lambda_client.get_waiter("function_active_v2").wait(
             FunctionName=names["lambda_function"]
         )
 
         test_api_flow(lambda_client, names["lambda_function"], claims)
+        test_index_fail_flow(
+            lambda_client, names, config, es_gen, index_names, claims
+        )
     finally:
         step("backend: remove temp architecture")
         error_list = temp_resource_set_delete(
-            dynamodb, iam, lambda_client, names
+            dynamodb, iam, lambda_client, es, names, index_names
         )
         if error_list and sys.exc_info()[0] is None:
             raise error_list[0]
 
 
-def temp_resource_set_delete(dynamodb, iam, lambda_client, names):
+def temp_resource_set_delete(dynamodb, iam, lambda_client, es, names, index_names):
     """Try every delete even if one delete fails, so one failure does not
     prevent cleanup of the remaining resource objects."""
+    error_list = []
+
+    # the temp indices first: while their deletion fails (typically the es
+    # worker being down), keeping the aws residue discoverable by --clean also
+    # keeps THEM discoverable (--clean derives index names from aws residue)
+    for index_name in (index_names["index_tag"], index_names["index_type"]):
+        try:
+            result = es.index_delete(index_name)
+            if result["code"] != 0:
+                raise TestFail(result.get("message", "index delete failed"))
+            print(f"index deleted: {index_name}")
+        except Exception as error:
+            error_list.append(error)
+            print(f"cleanup failed for index {index_name}: {error}")
+
     operation_list = [
         (lambda_delete, lambda_client, names["lambda_function"]),
         (lambda_role_delete, iam, names["lambda_role"]),
     ]
     for table_key in TABLE_KEY_LIST:
         operation_list.append((table_delete, dynamodb, names[table_key]))
-    error_list = []
     for operation, client, resource_name in operation_list:
         try:
             operation(client, resource_name)
@@ -165,7 +207,11 @@ def temp_resource_set_delete(dynamodb, iam, lambda_client, names):
 def test_resources_clean(config):
     """Locate test resources by the configured prefix + '-temp-' marker and
     attempt to remove all of them. Only resource types created by the backend
-    test are considered."""
+    test are considered. Temp name indices are located indirectly: their
+    timestamps are recovered from the aws residue names (the local es service
+    has no index list api), so an index whose aws residue is already fully
+    removed cannot be found here; delete such an index via
+    _2_local_es/es_client.py index-delete."""
     prefix = config["name_prefix"]
     name_marker = f"{prefix}-temp-"
     dynamodb = aws_client_make(config, "dynamodb")
@@ -204,6 +250,27 @@ def test_resources_clean(config):
 
     print(f"  found {resource_count} resource(s)")
     error_list = []
+
+    # temp indices of the found runs first, refer to temp_resource_set_delete
+    es = local_es_client_make(config, local_es_gen_load())
+    timestamp_set = set()
+    for name in function_name_list + role_name_list + table_name_list:
+        match = TIMESTAMP_TEMP_RE.search(name)
+        if match is not None:
+            timestamp_set.add(match.group(1))
+    for timestamp in sorted(timestamp_set):
+        index_names = index_names_build(f"_temp_{timestamp}")
+        for index_name in (index_names["index_tag"], index_names["index_type"]):
+            try:
+                result = es.index_delete(index_name)
+                if result["code"] != 0:
+                    raise TestFail(result.get("message", "index delete failed"))
+                if result["data"]["is_deleted"]:
+                    print(f"index deleted: {index_name}")
+            except Exception as error:
+                error_list.append(error)
+                print(f"cleanup failed for index {index_name}: {error}")
+
     for operation, client, resource_name_list in [
         (lambda_delete, lambda_client, function_name_list),
         (lambda_role_delete, iam, role_name_list),
@@ -220,9 +287,19 @@ def test_resources_clean(config):
     print("  all matching test resources removed or scheduled for deletion")
 
 
-def temp_resources_absent_check(dynamodb, iam, lambda_client, names):
+def temp_resources_absent_check(dynamodb, iam, lambda_client, es, names, index_names):
     """suspend the test if a resource instance with the name and type of a
-    temp resource object to be created already exists."""
+    temp resource object to be created already exists. the index check also
+    proves the es worker is reachable before any temp resource is created."""
+    for index_name in (index_names["index_tag"], index_names["index_type"]):
+        result = es.index_check(index_name)
+        if result["code"] != 0:
+            raise SystemExit(
+                f"local es service not reachable ({result.get('message')}), "
+                "is the worker on the home server running?"
+            )
+        if result["data"]["is_existing"]:
+            raise SystemExit(f"test suspended: index already exists: {index_name}")
     for table_key in TABLE_KEY_LIST:
         table_name = names[table_key]
         try:
@@ -315,6 +392,34 @@ def test_api_flow(lambda_client, function_name, claims):
     response = call("PATCH", f"/api/tag/{tag_a}", {"parent_id": tag_a})
     check(response["code"] < 0, f"a tag as its own parent fails: {response}")
 
+    # -------------------------------------------------- char-level name search
+    step("backend: char-level name search through the local es index")
+    response = call("GET", "/api/tag/search", query={"query": "alpha"})
+    check(response["code"] == 0, f"search request succeeds: {response}")
+    results = response["data"]["results"]
+    check(
+        [item["tag_id"] for item in results] == [tag_a],
+        f"search 'alpha' finds exactly the alpha tag: {results}",
+    )
+    match_list = results[0]["match_list"]
+    check(
+        match_list == [{"field": "name", "index_start": 0, "index_end": 5}],
+        f"match positions cover 'alpha' inside 'alpha tag': {match_list}",
+    )
+
+    response = call("GET", "/api/tag/search", query={"query": "TAG"})
+    check(
+        len(response["data"]["results"]) == 3,
+        "case-insensitive substring 'TAG' matches all 3 names",
+    )
+    response = call("GET", "/api/tag/search", query={"query": "no such name"})
+    check(
+        response["data"]["results"] == [],
+        "search without a matching substring returns nothing",
+    )
+    response = call("GET", "/api/tag/search")
+    check(response["code"] < 0, f"search without 'query' fails: {response}")
+
     # -------------------------------------------------------------- tag history
     step("backend: tag edit history and is_history_enabled toggling")
     response = call("GET", f"/api/tag/{tag_a}/history")
@@ -326,6 +431,11 @@ def test_api_flow(lambda_client, function_name, claims):
 
     response = call("PATCH", f"/api/tag/{tag_a}", {"name": "alpha tag renamed"})
     check(response["code"] == 0, f"tag rename succeeds: {response}")
+    response = call("GET", "/api/tag/search", query={"query": "renamed"})
+    check(
+        [item["tag_id"] for item in response["data"]["results"]] == [tag_a],
+        "rename is reflected in the name index",
+    )
     response = call("GET", f"/api/tag/{tag_a}/history")
     history = response["data"]["history"]
     check(
@@ -462,6 +572,11 @@ def test_api_flow(lambda_client, function_name, claims):
     )
     response = call("GET", f"/api/tag/{tag_c}")
     check(response["code"] < 0, "deleted tag is not found any more")
+    response = call("GET", "/api/tag/search", query={"query": "gamma"})
+    check(
+        response["data"]["results"] == [],
+        "deleted tag is gone from the name index",
+    )
     response = call("GET", f"/api/tag/{tag_b}/children")
     check(response["data"]["children"] == [], "beta has no children any more")
 
@@ -484,6 +599,17 @@ def test_api_flow(lambda_client, function_name, claims):
         "tag list still holds alpha and beta (no type rows leak in)",
     )
 
+    response = call("GET", "/api/type/search", query={"query": "file"})
+    check(
+        [item["type_id"] for item in response["data"]["results"]] == [type_x],
+        "type name search finds the type through the type index",
+    )
+    response = call("GET", "/api/tag/search", query={"query": "file"})
+    check(
+        response["data"]["results"] == [],
+        "tag search does not see type names (separate indices)",
+    )
+
     response = call("POST", f"/api/obj/{obj_1}/type", {"type_id": type_x})
     check(response["code"] == 0, f"type attach succeeds: {response}")
     response = call("GET", f"/api/obj/{obj_1}/type")
@@ -499,6 +625,66 @@ def test_api_flow(lambda_client, function_name, claims):
     check(
         [record["operation"] for record in response["data"]["history"]] == ["create"],
         "type edit history is recorded in its own table",
+    )
+
+
+def test_index_fail_flow(lambda_client, names, config, es_gen, index_names, claims):
+    """an edit whose index operation is not confirmed must fail without
+    changing dynamodb. simulated by setting the lambda's result timeout to 0:
+    the index task is still sent, but the lambda gives up waiting for the
+    worker's confirmation immediately, reproducing 'sqs message not consumed /
+    no confirmation of index complete' while the real worker keeps running."""
+    function_name = names["lambda_function"]
+
+    def call(method, path, body=None, query=None):
+        return lambda_api_call(
+            lambda_client, function_name, claims, method, path, body, query
+        )
+
+    def lambda_env_set(env):
+        lambda_client.update_function_configuration(
+            FunctionName=function_name, Environment={"Variables": env}
+        )
+        lambda_client.get_waiter("function_updated_v2").wait(
+            FunctionName=function_name
+        )
+
+    env_normal = lambda_env_build(names, config, es_gen, index_names)
+
+    step("backend: edits fail while the index confirmation does not arrive")
+    response = call("GET", "/api/tag")
+    tag_list_before = response["data"]["tags"]
+    # the target must be a leaf (beta, the one having a parent), so the delete
+    # reaches the index operation instead of being refused for having children
+    tag_leaf = next(tag for tag in tag_list_before if tag.get("parent_id"))
+
+    lambda_env_set({**env_normal, "ES_RESULT_TIMEOUT_SEC": "0"})
+    try:
+        response = call("POST", "/api/tag", {"name": "unconfirmed tag"})
+        check(
+            response["code"] < 0,
+            f"creation fails without index confirmation: {response}",
+        )
+        response = call(
+            "PATCH", f"/api/tag/{tag_leaf['tag_id']}",
+            {"name": "unconfirmed rename"},
+        )
+        check(
+            response["code"] < 0,
+            f"rename fails without index confirmation: {response}",
+        )
+        response = call("DELETE", f"/api/tag/{tag_leaf['tag_id']}")
+        check(
+            response["code"] < 0,
+            f"delete fails without index confirmation: {response}",
+        )
+    finally:
+        lambda_env_set(env_normal)
+
+    response = call("GET", "/api/tag")
+    check(
+        response["data"]["tags"] == tag_list_before,
+        "the failed edits left dynamodb unchanged",
     )
 
 

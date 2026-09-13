@@ -1,7 +1,7 @@
 # ensure all aws resource instances of the tag/type service, in dependency
 # order:
-#   4 tag tables + 4 type tables -> lambda role -> lambda function
-#   -> http api (jwt authorizer, route)
+#   2 name indices on the local es service -> 4 tag tables + 4 type tables
+#   -> lambda role -> lambda function -> http api (jwt authorizer, route)
 #
 # 'ensure' means: create if missing, update if config differs, never recreate.
 # generated ids are saved to config_gen.yaml. no frontend resources yet
@@ -9,10 +9,14 @@
 #
 # generic ensure/delete logic lives in /aws_utils/ (see
 # /doc/aws_oa_impl.md#shared-utilities-aws_utils); this script only holds
-# what is specific to this service: table schemas, role policy, lambda env.
+# what is specific to this service: table schemas, role policy, lambda env,
+# and the name indices on the local es service.
 #
 # cognito ids come from ../_0_auth_cognito/config_gen.yaml (run
-# ensure_cognito.py + ensure_user_table.py there first).
+# ensure_cognito.py + ensure_user_table.py there first). the local es task
+# queue/result table come from ../_2_local_es/config_gen.yaml (run
+# ensure_architect.py there first); ensuring/deleting the indices needs the
+# es worker on the home server running.
 #
 # delete everything:            python ensure_architect.py --delete all
 # delete under an old prefix:   python ensure_architect.py --delete all --assume-prefix xxx
@@ -42,12 +46,19 @@ from aws_utils import (
     table_ensure,
 )
 from config_gen import (
+    ES_FIELD_CONFIG,
+    ES_INDEX_CONFIG_NAME,
+    ES_RESULT_TIMEOUT_SEC,
+    PATH_LOCAL_ES_CLIENT,
     TABLE_KEY_LIST,
     aws_client_make,
     cognito_gen_load,
     config_gen_load,
     config_gen_save,
     config_load,
+    index_names_build,
+    local_es_client_make,
+    local_es_gen_load,
     names_build,
 )
 
@@ -71,6 +82,41 @@ def args_parse():
     if args.assume_prefix is not None and args.delete != "all":
         parser.error("--assume-prefix can only be used with --delete all")
     return args
+
+
+# --------------------------------------------------------- name indices (es)
+
+
+def indices_ensure(es, index_names):
+    """ensure the tag name index and the type name index on the local es
+    service ('char' config: case-insensitive substring search over the name,
+    user_id as exact filter). the worker on the home server must be running;
+    without a confirmed index the ensure fails, matching the api behavior
+    (creation fails when the name is not indexed)."""
+    for index_name in (index_names["index_tag"], index_names["index_type"]):
+        result = es.index_ensure(index_name, ES_INDEX_CONFIG_NAME, ES_FIELD_CONFIG)
+        if result["code"] != 0:
+            raise SystemExit(
+                f"index ensure failed for {index_name}: {result.get('message')}"
+            )
+        state = "created" if result["data"]["is_created"] else "already exists, ok"
+        print(f"index {index_name}: {state}")
+
+
+def indices_delete(es, index_names):
+    """delete the two name indices. failures (typically the worker being
+    down) are reported but do not stop the aws-side deletion."""
+    for index_name in (index_names["index_tag"], index_names["index_type"]):
+        result = es.index_delete(index_name)
+        if result["code"] != 0:
+            print(
+                f"index delete FAILED for {index_name}: {result.get('message')}"
+                " -- delete it later via _2_local_es/es_client.py index-delete"
+            )
+        elif result["data"]["is_deleted"]:
+            print(f"index deleted: {index_name}")
+        else:
+            print(f"index does not exist: {index_name}")
 
 
 # --------------------------------------------------------------------- tables
@@ -175,10 +221,11 @@ def tag_type_tables_ensure(dynamodb, names):
 # ---------------------------------------------------------------- role/lambda
 
 
-def api_role_ensure(iam, names, region, account_id):
+def api_role_ensure(iam, names, region, account_id, es_gen):
     """execution role of the api lambda: cloudwatch logs, read of the user
     table (owned by _0_auth_cognito), full item access on all eight tag/type
-    tables. returns the role arn."""
+    tables, plus the requester side of the local es service (send index
+    tasks, read results). returns the role arn."""
     resource_list = []
     for table_key in TABLE_KEY_LIST:
         table_arn = f"arn:aws:dynamodb:{region}:{account_id}:table/{names[table_key]}"
@@ -215,12 +262,24 @@ def api_role_ensure(iam, names, region, account_id):
                 ],
                 "Resource": resource_list,
             },
+            {
+                "Sid": "EsTaskSend",
+                "Effect": "Allow",
+                "Action": ["sqs:SendMessage"],
+                "Resource": es_gen["queue_task"]["queue_arn"],
+            },
+            {
+                "Sid": "EsResultRead",
+                "Effect": "Allow",
+                "Action": ["dynamodb:GetItem"],
+                "Resource": es_gen["table_result"]["table_arn"],
+            },
         ],
     }
     return lambda_role_ensure(iam, names["lambda_role"], policy)
 
 
-def lambda_env_build(names, config):
+def lambda_env_build(names, config, es_gen, index_names):
     service_config = config["tag_type"]
     return {
         "TABLE_TAG": names["table_tag"],
@@ -234,24 +293,32 @@ def lambda_env_build(names, config):
         "TABLE_USER": names["table_user"],
         "GROUP_ACCESS": service_config["cognito"]["group_access"],
         "GROUP_ADMIN": service_config["cognito"]["group_admin"],
+        "INDEX_TAG": index_names["index_tag"],
+        "INDEX_TYPE": index_names["index_type"],
+        "ES_QUEUE_URL": es_gen["queue_task"]["queue_url"],
+        "ES_RESULT_TABLE": es_gen["table_result"]["table_name"],
+        "ES_REGION": es_gen["region_name"],
+        "ES_RESULT_TIMEOUT_SEC": str(ES_RESULT_TIMEOUT_SEC),
     }
 
 
-def api_lambda_ensure(lambda_client, names, config, role_arn):
+def api_lambda_ensure(lambda_client, names, config, role_arn, es_gen, index_names):
+    # es_client.py of _2_local_es is packaged into the zip: the lambda uses
+    # it as the requester library of the local es service
     return lambda_function_ensure(
         lambda_client,
         names["lambda_function"],
         config["tag_type"]["lambda"],
         role_arn,
-        lambda_env_build(names, config),
-        lambda_zip_build(DIR_BACKEND),
+        lambda_env_build(names, config, es_gen, index_names),
+        lambda_zip_build(DIR_BACKEND, [PATH_LOCAL_ES_CLIENT]),
     )
 
 
 # --------------------------------------------------------------------- delete
 
 
-def architecture_delete(config, names):
+def architecture_delete(config, names, is_prefix_assumed):
     delete_confirm(
         f"All tag/type AWS resources with prefix {config['name_prefix']!r} "
         "will be deleted."
@@ -267,6 +334,16 @@ def architecture_delete(config, names):
     lambda_role_delete(iam, names["lambda_role"])
     for table_key in TABLE_KEY_LIST:
         table_delete(dynamodb, names[table_key])
+
+    # the name indices do not carry the aws name prefix, so when deleting an
+    # OLD architecture under --assume-prefix they may still be in use by the
+    # currently deployed one: only the deletion of the current architecture
+    # (no assumed prefix) deletes them
+    if is_prefix_assumed:
+        print("indices kept: --assume-prefix deletes only the aws resources")
+        return
+    es = local_es_client_make(config, local_es_gen_load())
+    indices_delete(es, index_names_build())
 
 
 # ----------------------------------------------------------------------- main
@@ -297,10 +374,20 @@ def architecture_ensure(config, names):
     sts = aws_client_make(config, "sts")
     account_id = sts.get_caller_identity()["Account"]
 
+    # name indices first: the write apis refuse to work while the index is
+    # not reachable, so a deploy with the es worker down fails here, before
+    # any aws resource is touched
+    es_gen = local_es_gen_load()
+    index_names = index_names_build()
+    es = local_es_client_make(config, es_gen)
+    indices_ensure(es, index_names)
+
     tag_type_tables_ensure(dynamodb, names)
 
-    role_arn = api_role_ensure(iam, names, region, account_id)
-    lambda_arn = api_lambda_ensure(lambda_client, names, config, role_arn)
+    role_arn = api_role_ensure(iam, names, region, account_id, es_gen)
+    lambda_arn = api_lambda_ensure(
+        lambda_client, names, config, role_arn, es_gen, index_names
+    )
 
     api_id, api_endpoint = http_api_ensure(apigw, names["http_api"])
     authorizer_id = jwt_authorizer_ensure(apigw, api_id, issuer, client_id)
@@ -314,6 +401,8 @@ def architecture_ensure(config, names):
     config_gen = config_gen_load()
     config_gen["tag_type"] = {
         **{table_key: names[table_key] for table_key in TABLE_KEY_LIST},
+        "index_tag": index_names["index_tag"],
+        "index_type": index_names["index_type"],
         "lambda_arn": lambda_arn,
         "api_id": api_id,
         "api_endpoint": api_endpoint,
@@ -332,7 +421,7 @@ def main():
     names = names_build(config)
 
     if args.delete == "all":
-        architecture_delete(config, names)
+        architecture_delete(config, names, args.assume_prefix is not None)
         return
     architecture_ensure(config, names)
 

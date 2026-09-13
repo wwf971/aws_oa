@@ -13,6 +13,9 @@
 # 'tag' path below also exists with 'type' instead of 'tag'):
 #   GET    /api/me                            role of the caller
 #   GET    /api/tag?name=                     list/search own tags by name
+#   GET    /api/tag/search?query=&limit=      char-level name search through
+#                                              the local es index, results
+#                                              carry match positions
 #   POST   /api/tag                           create {name, parent_id?,
 #                                              is_history_enabled?, time_zone?}
 #   GET    /api/tag/{tag_id}                  one tag
@@ -44,6 +47,13 @@
 # as numbers, each accompanied by a timezone attribute in signed minutes
 # (e.g. +09:00 -> 540). obj ids are plain references, not validated against
 # the sub-project owning the obj.
+#
+# name index: tag and type names are char-level searchable through the local
+# es service of _2_local_es (one separate index per side). every write api
+# runs its index operation first and only touches dynamodb after the index
+# operation is confirmed, refer to the 'name index' comment block below.
+# es_client.py is the aws-side library of _2_local_es, packaged into this
+# lambda's zip by ensure_architect.py.
 
 import base64
 import json
@@ -56,10 +66,20 @@ from decimal import Decimal
 import boto3
 from boto3.dynamodb.conditions import Key
 from boto3.dynamodb.types import TypeSerializer
+from es_client import EsClient
 
 TABLE_USER = os.environ["TABLE_USER"]
 GROUP_ACCESS = os.environ["GROUP_ACCESS"]
 GROUP_ADMIN = os.environ["GROUP_ADMIN"]
+
+# pointer to the local es service (task queue + result table of _2_local_es)
+# and the name indices of this service, all provided by ensure_architect.py
+ES_QUEUE_URL = os.environ["ES_QUEUE_URL"]
+ES_RESULT_TABLE = os.environ["ES_RESULT_TABLE"]
+ES_REGION = os.environ["ES_REGION"]
+ES_RESULT_TIMEOUT_SEC = float(os.environ["ES_RESULT_TIMEOUT_SEC"])
+ES_RESULT_POLL_SEC = 0.25
+ES_INDEX_CONFIG_NAME = "char"
 
 ID_LENGTH = 16
 ID_CHARS = string.digits + string.ascii_lowercase
@@ -77,6 +97,7 @@ TIME_KEY_RANDOM_LENGTH = 4
 
 TIMEZONE_MINUTES_MAX = 14 * 60
 HISTORY_LIMIT_DEFAULT = 100
+SEARCH_LIMIT_DEFAULT = 100
 ANCESTOR_DEPTH_MAX = 100
 
 dynamodb = boto3.resource("dynamodb")
@@ -85,10 +106,23 @@ serializer = TypeSerializer()
 
 table_user = dynamodb.Table(TABLE_USER)
 
+# requester of the local es service: sends one task into the task queue of
+# _2_local_es, then polls its result table for the worker's confirmation.
+# the boto3 clients carry no explicit keys, they use this lambda's role.
+es_client = EsClient(
+    sqs=boto3.client("sqs", region_name=ES_REGION),
+    db=boto3.client("dynamodb", region_name=ES_REGION),
+    queue_url=ES_QUEUE_URL,
+    table_name=ES_RESULT_TABLE,
+    result_timeout_sec=ES_RESULT_TIMEOUT_SEC,
+    result_poll_sec=ES_RESULT_POLL_SEC,
+)
+
 
 def kind_build(kind_name):
-    """table set of one side (tag or type). all shared code receives one of
-    these descriptors and never touches the other side's tables."""
+    """table set + name index of one side (tag or type). all shared code
+    receives one of these descriptors and never touches the other side's
+    tables or index."""
     key = kind_name.upper()
     names = {
         "entity": os.environ[f"TABLE_{key}"],
@@ -100,6 +134,7 @@ def kind_build(kind_name):
         "kind": kind_name,
         "id_attr": f"{kind_name}_id",
         "gsi_id": f"gsi_{kind_name}_id",
+        "index_name": os.environ[f"INDEX_{key}"],
         "table_entity_name": names["entity"],
         "table_history_name": names["history"],
         "table_obj_name": names["obj"],
@@ -173,6 +208,10 @@ def route_kind(kind, method, rest, query, body, user_id):
             return api_entity_list(kind, user_id, query)
         if method == "POST":
             return api_entity_create(kind, user_id, body)
+    # 'search' is a reserved path word, it can never collide with an entity
+    # id (ids are 16 random chars of 0-9 a-z)
+    elif rest == ["search"] and method == "GET":
+        return api_entity_search(kind, user_id, query)
     elif len(rest) == 1:
         entity_id = rest[0]
         if method == "GET":
@@ -373,6 +412,44 @@ def transact_delete(table_name, key):
     return {"Delete": {"TableName": table_name, "Key": item_typed(key)}}
 
 
+# ------------------------------------------------------- name index (local es)
+#
+# each side owns one char-level index on the local es service, holding one doc
+# per tag/type: {name, user_id}, keyed by the entity id. only the name is
+# searched; user_id is an exact filter keeping every search inside the
+# caller's own data.
+#
+# the dynamodb tables are the source of truth. a doc in the index whose entity
+# is missing or stale in dynamodb is harmless, because search results are
+# resolved through dynamodb before being returned. but an entity in dynamodb
+# that is NOT indexed would silently never appear in char search. so every
+# write api runs its index operation FIRST, and only touches dynamodb after
+# the worker confirmed the index operation: create/rename/delete fail without
+# changing dynamodb when the index is not updated (worker down, sqs message
+# not consumed, no confirmation before the timeout, ...).
+
+
+def index_doc_put(kind, user_id, entity_id, name):
+    result = es_client.doc_put(
+        kind["index_name"], entity_id, {"name": name, "user_id": user_id}
+    )
+    index_result_check(kind, result)
+
+
+def index_doc_delete(kind, entity_id):
+    result = es_client.doc_delete(kind["index_name"], entity_id)
+    index_result_check(kind, result)
+
+
+def index_result_check(kind, result):
+    if result["code"] != 0:
+        raise ApiError(
+            -6,
+            f"name index of {kind['kind']} not updated: {result.get('message', '')}",
+            http_status=502,
+        )
+
+
 # ------------------------------------------------- entity storage (tag / type)
 
 
@@ -570,6 +647,39 @@ def api_entity_list(kind, user_id, query):
     return resp_ok({f"{kind['kind']}s": entities})
 
 
+def api_entity_search(kind, user_id, query):
+    """char-level name search through the local es index: the query text
+    matches any substring of a name, case-insensitive. each result is the
+    entity plus match_list ([{field, index_start, index_end}] over the name)
+    for highlighting."""
+    text = (query.get("query") or "").strip()
+    if not text:
+        raise ApiError(-1, "query parameter 'query' is required")
+    limit = int_query_parse(query, "limit", default=SEARCH_LIMIT_DEFAULT)
+    result = es_client.search(
+        kind["index_name"], ES_INDEX_CONFIG_NAME, text, ["name"],
+        filter_exact={"user_id": user_id}, limit=limit,
+    )
+    if result["code"] != 0:
+        raise ApiError(
+            -6,
+            f"name index search failed: {result.get('message', '')}",
+            http_status=502,
+        )
+    found = []
+    for hit in result["data"]:
+        item = kind["table_entity"].get_item(
+            Key={"user_id": user_id, kind["id_attr"]: hit["doc_id"]}
+        ).get("Item")
+        # the index can be momentarily ahead of dynamodb (e.g. a create whose
+        # dynamodb write failed after the doc was indexed); results are
+        # resolved through dynamodb and such docs are dropped
+        if item is None:
+            continue
+        found.append({**item, "match_list": hit["match_list"]})
+    return resp_ok({"results": found})
+
+
 def api_entity_get(kind, user_id, entity_id):
     return resp_ok({kind["kind"]: entity_get(kind, user_id, entity_id)})
 
@@ -588,9 +698,10 @@ def api_entity_create(kind, user_id, body):
         entity_get(kind, user_id, parent_id)
 
     time_stamp = now_ms()
+    entity_id = id_generate()
     entity = {
         "user_id": user_id,
-        kind["id_attr"]: id_generate(),
+        kind["id_attr"]: entity_id,
         "name": name,
         "is_history_enabled": is_history_enabled,
         "create_at": time_stamp,
@@ -602,6 +713,9 @@ def api_entity_create(kind, user_id, body):
     if parent_id is not None:
         entity["parent_id"] = parent_id
         detail["parent_id"] = parent_id
+    # index first: when the name is not confirmed indexed, the creation
+    # itself fails and dynamodb is never written (see the name index block)
+    index_doc_put(kind, user_id, entity_id, name)
     entity_save(kind, entity, user_id, "create", detail, time_zone)
     return resp_ok({kind["kind"]: entity})
 
@@ -636,6 +750,10 @@ def api_entity_update(kind, user_id, entity_id, body):
     time_zone = timezone_parse(body.get("time_zone", 0), "time_zone")
     entity["modify_at"] = now_ms()
     entity["modify_at_timezone"] = time_zone
+    # a name change re-indexes first: when the new name is not confirmed
+    # indexed, the update fails and dynamodb keeps the old name
+    if "name" in detail:
+        index_doc_put(kind, user_id, entity_id, entity["name"])
     # while logging is on the edit and its history record share one
     # transaction; the toggle-on edit itself is the first logged record
     entity_save(kind, entity, user_id, "update", detail, time_zone)
@@ -653,6 +771,11 @@ def api_entity_delete(kind, user_id, entity_id):
             f"{kind['kind']} still has {len(child_list)} child(ren), "
             "move or delete them first",
         )
+
+    # index first: a failed doc delete fails the whole delete while both the
+    # doc and the entity are still in place, and a retry simply runs the doc
+    # delete again (a no-op when the doc is already gone)
+    index_doc_delete(kind, entity_id)
 
     # detach from every obj first; each detach logs to that obj's history
     entry_list = entity_obj_entries(kind, entity_id)

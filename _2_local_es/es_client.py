@@ -30,19 +30,25 @@
 # iam permissions needed (requester):
 #   sqs: SendMessage (+ GetQueueUrl when config_gen.yaml is absent)
 #   dynamodb: GetItem
+#
+# a consumer that cannot read this sub-project's config files (e.g. code
+# packaged into a lambda, where only this single file is shipped) imports the
+# EsClient class alone and constructs it with its own boto3 clients + the
+# queue url / table name it got from its own deploy config; that is why this
+# module only imports the config module lazily, inside es_client_make().
 
 import argparse
 import json
+import random
 import time
 
-from config import (
-    aws_client_make,
-    config_gen_load,
-    config_load,
-    id_random,
-    names_build,
-    queue_url_find,
-)
+# random 0-9a-z id (id-format.md). local copy instead of the one in config.py,
+# so EsClient stays usable where the config module is absent (see above).
+ID_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def id_random(length=16):
+    return "".join(random.choice(ID_CHARS) for _ in range(length))
 
 
 class EsClient:
@@ -136,6 +142,16 @@ class EsClient:
 
 
 def es_client_make(config=None):
+    # config import is lazy so that importing EsClient alone works without
+    # the config module (refer to the header comment)
+    from config import (
+        aws_client_make,
+        config_gen_load,
+        config_load,
+        names_build,
+        queue_url_find,
+    )
+
     if config is None:
         config = config_load()
     names = names_build(config)

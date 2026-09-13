@@ -5,9 +5,11 @@
 # read from ../_0_auth_cognito/config_gen.yaml.
 
 # unified name prefix of all aws resource instances of THIS service (tables,
-# lambda, api). each service has its own prefix.
-# style: {user alias}-{sub-project name}.
-name_prefix: alice123-tag-type
+# lambda, api). each service has its own prefix, and resource names terminate
+# it with the '--' separator: {prefix}--{resource-name}
+# (/doc/aws_oa.md#sub-project-namespace), so '--' must not occur inside the
+# prefix itself. style: {user alias}-{time}-{sub-project name}.
+name_prefix: alice123-2026-tag-type
 
 tag_type:
   cognito:
@@ -23,5 +25,6 @@ tag_type:
   lambda:
     runtime: python3.12
     memory_mb: 256
-    # pure dynamodb api, no large transfer inside lambda
+    # dynamodb plus one local es round trip per write api; the timeout must
+    # cover the 20s wait for an index confirmation that never arrives
     timeout_sec: 30
